@@ -23,7 +23,9 @@ chmod 600 /var/lib/fprint/0-persistent/synatlsmoc/* 2>/dev/null
 echo "### 4. Rate-limit fingerprint attempts at GDM/lock screen (pam_faillock, fingerprint path only)"
 cp -a /etc/pam.d/gdm-fingerprint "$BK/"
 if ! grep -q pam_faillock /etc/pam.d/gdm-fingerprint; then
-  sed -i 's|^auth\trequired\tpam_fprintd.so$|auth\trequired\tpam_faillock.so preauth silent\nauth\trequired\tpam_fprintd.so max-tries=3 timeout=30\nauth\t[default=die]\tpam_faillock.so authfail|' /etc/pam.d/gdm-fingerprint
+  # pam_fprintd returns authinfo_unavail on prompt timeout / daemon restart (GDM keeps a prompt open at the lock
+  # screen), so only auth_err/maxtries (real mismatches) may reach pam_faillock authfail.
+  sed -i 's|^auth\trequired\tpam_fprintd.so$|auth\trequired\tpam_faillock.so preauth silent\nauth\t[success=2 authinfo_unavail=1 default=bad]\tpam_fprintd.so max-tries=3 timeout=30\nauth\t[default=die]\tpam_faillock.so authfail\nauth\t[default=die]\tpam_deny.so|' /etc/pam.d/gdm-fingerprint
   sed -i 's|^@include common-account$|account\trequired\tpam_faillock.so\n@include common-account|' /etc/pam.d/gdm-fingerprint
 fi
 grep -nE 'faillock|fprintd' /etc/pam.d/gdm-fingerprint

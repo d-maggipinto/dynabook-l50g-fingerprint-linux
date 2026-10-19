@@ -19,6 +19,7 @@ reviewer agent (every driver file + libfprint core helpers + fprintd patch), sys
 - /var/lib/fprint tree 0700/0600; blob root-only.
 - fprintd sandbox drop-in `20-hardening.conf`: no capabilities, native syscalls only, ~@privileged/@resources/…, RestrictNamespaces, ProtectProc=invisible, IPAddressDeny, UMask=0077, DeviceAllow limited to usb. `systemd-analyze security` exposure 1.5.
 - PAM: `gdm-fingerprint` rate-limited with pam_faillock (3 fails → 10 min lockout of the fingerprint path only; password unaffected). pam_fprintd max-tries=3 timeout=30. No fprintd in sudo/polkit/common-auth.
+  Gotcha: pam_fprintd returns `authinfo_unavail` on prompt timeout and on daemon restart, and GDM keeps a fingerprint prompt open at the lock screen, so a naive `required` + `authfail` stack locks the user out within ~90 s of idle lock screen. The stack routes `authinfo_unavail` to `pam_deny` without counting; only `auth_err`/`maxtries` reach `authfail`.
 - dpkg-owned polkit policy restored (local build differed only in translations); `dpkg -V fprintd` clean.
 
 ## Verified after patching
