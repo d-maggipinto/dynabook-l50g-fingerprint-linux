@@ -1,0 +1,39 @@
+From 277ca77d8dab45f69bc2a2d7dc9a0a489bbaa2b5 Mon Sep 17 00:00:00 2001
+From: d4nt3cyb <hester95denis@gmail.com>
+Date: Mon, 19 Oct 2026 11:03:42 +0100
+Subject: [PATCH] synatlsmoc: add Synaptics 06cb:00eb (Dynabook Satellite Pro
+ L50-G)
+
+Co-Authored-By: Claude Mythos 5.1 <noreply@anthropic.com>
+---
+ data/autosuspend.hwdb                     | 1 +
+ libfprint/drivers/synatlsmoc/synatlsmoc.c | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/data/autosuspend.hwdb b/data/autosuspend.hwdb
+index 68199df..11d0162 100644
+--- a/data/autosuspend.hwdb
++++ b/data/autosuspend.hwdb
+@@ -276,6 +276,7 @@ usb:v06CBp00D6*
+ usb:v06CBp00D8*
+ usb:v06CBp00E7*
+ usb:v06CBp00E9*
++usb:v06CBp00EB*
+ usb:v06CBp00FF*
+ usb:v06CBp0169*
+  ID_AUTOSUSPEND=1
+diff --git a/libfprint/drivers/synatlsmoc/synatlsmoc.c b/libfprint/drivers/synatlsmoc/synatlsmoc.c
+index 60c0df0..172364a 100644
+--- a/libfprint/drivers/synatlsmoc/synatlsmoc.c
++++ b/libfprint/drivers/synatlsmoc/synatlsmoc.c
+@@ -132,6 +132,7 @@ static const FpIdEntry id_table[] = {
+     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00D8, },
+     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00E7, },
+     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00E9, },
++    { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00EB, },
+     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00FF, },
+     // { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x0124, },
+     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x0169, },
+-- 
+2.53.0
+

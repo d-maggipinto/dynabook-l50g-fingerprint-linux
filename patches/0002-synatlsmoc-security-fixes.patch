@@ -1,0 +1,316 @@
+From d59e91ad6db2e2b5dccb71cd0bb5bce4d34ad0b7 Mon Sep 17 00:00:00 2001
+From: d4nt3cyb <hester95denis@gmail.com>
+Date: Mon, 19 Oct 2026 11:33:19 +0100
+Subject: [PATCH] synatlsmoc: security fixes from review
+
+- Gate application data, wrap/unwrap and the open state machine on a
+  completed TLS handshake (FINISHED + AES-GCM both directions). A device
+  that never finishes the handshake could previously drive every later
+  command, including identify, in plaintext.
+- Accept ChangeCipherSpec only after ServerHelloDone with keys derived.
+- write_dft: do not g_autoptr a transfer whose ownership passes to
+  fpi_usb_transfer_submit (use-after-free reachable in bootloader path).
+- Persist pairing data only after the sensor certificate verified and
+  the handshake completed (no poisoned pairing blob from a fake device).
+- Bound the event-read and force-TLS-close loops.
+- CRYPTO_memcmp for Finished verify_data; check RAND_bytes results.
+- sample_pairing_data.h only under USE_SAMPLE_PAIRING_DATA.
+- fp-device: fix string leak when loading persistent data.
+
+Co-Authored-By: Claude Mythos 5.1 <noreply@anthropic.com>
+---
+ libfprint/drivers/synatlsmoc/synatlsmoc.c  | 38 ++++++++++++--
+ libfprint/drivers/synatlsmoc/synatlsmoc.h  |  3 +-
+ libfprint/drivers/synatlsmoc/tls_session.c | 58 ++++++++++++++++++++--
+ libfprint/drivers/synatlsmoc/tls_session.h |  1 +
+ libfprint/fp-device.c                      |  2 +-
+ 5 files changed, 91 insertions(+), 11 deletions(-)
+
+diff --git a/libfprint/drivers/synatlsmoc/synatlsmoc.c b/libfprint/drivers/synatlsmoc/synatlsmoc.c
+index 60c0df0..a245c81 100644
+--- a/libfprint/drivers/synatlsmoc/synatlsmoc.c
++++ b/libfprint/drivers/synatlsmoc/synatlsmoc.c
+@@ -41,7 +41,9 @@
+ #include "fpi-ssm.h"
+ #include "fpi-usb-transfer.h"
+ #include "pairing.h"
++#ifdef USE_SAMPLE_PAIRING_DATA
+ #include "sample_pairing_data.h"
++#endif
+ #include "sensor_public_keys.h"
+ #include "synatlsmoc.h"
+ #include "tagval.h"
+@@ -101,6 +103,8 @@ struct _FpiDeviceSynaTlsMoc
+   guint32 event_recv;
+   guint32 first_event;
+   guint num_pending_events;
++  guint event_read_rounds;
++  gboolean pairing_needs_save;
+   gboolean event_read_in_legacy_mode;
+ 
+   gboolean capture_started;
+@@ -1159,6 +1163,12 @@ recv_tls_data (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *err
+     {
+       fpi_ssm_jump_to_state (self->task_ssm, OPEN_TLS_SEND_DATA);
+     }
++  else if (!tls_session_is_established (self->session))
++    {
++      fpi_ssm_mark_failed (self->task_ssm,
++                           set_and_report_error (FP_DEVICE_ERROR_PROTO,
++                                                 "TLS handshake did not complete"));
++    }
+   else
+     {
+       fpi_ssm_next_state (self->task_ssm);
+@@ -1520,14 +1530,24 @@ recv_event_read (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *e
+       fp_dbg ("\tThere are %u events pending -> sending event read again",
+               self->num_pending_events);
+ #endif
++      if (++self->event_read_rounds > 64)
++        {
++          self->event_read_rounds = 0;
++          fpi_ssm_mark_failed (self->task_ssm,
++                               set_and_report_error (FP_DEVICE_ERROR_PROTO,
++                                                     "Sensor keeps reporting pending events"));
++          return;
++        }
+       send_event_read (self);
+     }
+   else if (self->event_recv & self->event_mask)
+     {
++      self->event_read_rounds = 0;
+       fpi_ssm_next_state (self->task_ssm);
+     }
+   else
+     {
++      self->event_read_rounds = 0;
+       fpi_ssm_jump_to_state (self->task_ssm,
+                              fpi_ssm_get_cur_state (self->task_ssm));
+     }
+@@ -3304,8 +3324,8 @@ write_dft (FpiDeviceSynaTlsMoc *self, const guint8 *data, const gsize data_size,
+   fp_dbg ("DFT -> %s", data_str);
+ #endif
+ 
+-  /* Send data */
+-  g_autoptr (FpiUsbTransfer) transfer = fpi_usb_transfer_new (FP_DEVICE (self));
++  /* Send data (ownership of the transfer passes to fpi_usb_transfer_submit) */
++  FpiUsbTransfer *transfer = fpi_usb_transfer_new (FP_DEVICE (self));
+   fpi_usb_transfer_fill_control (transfer, G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
+                                  G_USB_DEVICE_REQUEST_TYPE_VENDOR,
+                                  G_USB_DEVICE_RECIPIENT_DEVICE,
+@@ -3558,6 +3578,7 @@ store_pairing_data (FpiDeviceSynaTlsMoc *self)
+                                           server_cert_var, privkey_pem_var);
+ 
+   g_object_set (FP_DEVICE (self), "fpi-persistent-data", pairing_data, NULL);
++  self->pairing_needs_save = FALSE;
+ 
+ #ifdef DEBUG
+   g_autofree char *client_cert_str =
+@@ -3715,6 +3736,7 @@ pair (FpiDeviceSynaTlsMoc *self)
+ 
+   g_clear_pointer (&self->pairing_data.client_key, EVP_PKEY_free);
+   self->pairing_data.client_key = EVP_EC_gen ("prime256v1");
++  self->pairing_needs_save = TRUE;
+ 
+   /* we create it already serialized, as we do not need it in struct form */
+   GError *error = NULL;
+@@ -3810,7 +3832,11 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *device)
+       else if (self->session == NULL && self->server_established)
+         {
+           fp_warn ("Sensor is in TLS session but host is not");
+-          fpi_ssm_next_state (ssm);
++          if (++open_ssm_data->force_close_attempts > 2)
++            fpi_ssm_mark_failed (ssm, set_and_report_error (FP_DEVICE_ERROR_PROTO,
++                                                            "Sensor refuses to close its TLS session"));
++          else
++            fpi_ssm_next_state (ssm);
+         }
+       else if (self->session != NULL && self->server_established)
+         {
+@@ -3876,7 +3902,11 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *device)
+       }
+     case OPEN_SAVE_PAIRING_DATA:
+       {
+-        store_pairing_data (self);
++        /* Only reached after certificate verification and a completed TLS handshake */
++        if (self->pairing_needs_save)
++          store_pairing_data (self);
++        else
++          fpi_ssm_next_state (ssm);
+         break;
+       }
+     case OPEN_VERIFY_SENSOR_CERTIFICATE:
+diff --git a/libfprint/drivers/synatlsmoc/synatlsmoc.h b/libfprint/drivers/synatlsmoc/synatlsmoc.h
+index a54ebd8..79bb6af 100644
+--- a/libfprint/drivers/synatlsmoc/synatlsmoc.h
++++ b/libfprint/drivers/synatlsmoc/synatlsmoc.h
+@@ -337,10 +337,10 @@ typedef enum
+   OPEN_LOAD_SENSOR_KEY,
+   OPEN_LOAD_PAIRING_DATA,
+   OPEN_SEND_PAIR,
+-  OPEN_SAVE_PAIRING_DATA,
+   OPEN_VERIFY_SENSOR_CERTIFICATE,
+   OPEN_TLS_ESTABLISH,
+   OPEN_TLS_SEND_DATA,
++  OPEN_SAVE_PAIRING_DATA,
+   OPEN_SET_EVENT_MASK,
+   OPEN_NUM_STATES,
+ } OpenState;
+@@ -455,6 +455,7 @@ typedef struct
+ {
+   gboolean tried_to_exit_bootloader_mode;
+   gboolean tried_get_version_reset;
++  guint force_close_attempts;
+   EVP_PKEY *pub_key;
+ } OpenData;
+ 
+diff --git a/libfprint/drivers/synatlsmoc/tls_session.c b/libfprint/drivers/synatlsmoc/tls_session.c
+index 7968809..5a3a4dc 100644
+--- a/libfprint/drivers/synatlsmoc/tls_session.c
++++ b/libfprint/drivers/synatlsmoc/tls_session.c
+@@ -28,6 +28,7 @@
+ 
+ #include <glib.h>
+ #include <openssl/conf.h>
++#include <openssl/crypto.h>
+ #include <openssl/core_names.h>
+ #include <openssl/err.h>
+ #include <openssl/evp.h>
+@@ -407,7 +408,12 @@ tls_session_encrypt (TlsSession *self, guint8 type, guint8 *ptext, gsize ptext_s
+ 
+         // Create random nonce & add it to output
+         guint8 nonce[NONCE_SIZE];
+-        RAND_bytes (nonce, NONCE_SIZE);
++        if (RAND_bytes (nonce, NONCE_SIZE) != 1)
++          {
++            g_propagate_error (error, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                                                "RAND_bytes failed"));
++            return FALSE;
++          }
+ 
+         // encr_iv + nonce
+         gcm_iv = g_malloc (self->encr_iv_len + NONCE_SIZE);
+@@ -1397,7 +1403,7 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
+             return FALSE;
+           }
+ 
+-        if (memcmp (verify_data, server_verify_data, VERIFY_DATA_SIZE) != 0)
++        if (CRYPTO_memcmp (verify_data, server_verify_data, VERIFY_DATA_SIZE) != 0)
+           {
+             g_propagate_error (error, fpi_device_error_new_msg (
+                                           FP_DEVICE_ERROR_PROTO,
+@@ -1450,6 +1456,16 @@ tls_session_receive (TlsSession *self, TlsRecord *record, GError **error)
+                 return FALSE;
+               }
+ 
++            if (self->handshake_phase != SERVER_DONE || self->decr_key == NULL ||
++                self->pending_cs != TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384)
++              {
++                self->raised_alert_desc = SSL_AD_UNEXPECTED_MESSAGE;
++                g_propagate_error (error, fpi_device_error_new_msg (
++                                              FP_DEVICE_ERROR_PROTO,
++                                              "Unexpected ChangeCipherSpec (phase %d)", self->handshake_phase));
++                return FALSE;
++              }
++
+             // Switch encryption algorithms
+             self->server_cs = self->pending_cs;
+             self->pending_cs = TLS_NULL_WITH_NULL_NULL;
+@@ -1540,6 +1556,15 @@ tls_session_receive (TlsSession *self, TlsRecord *record, GError **error)
+             gsize app_data_size;
+             const guint8 *app_data = NULL;
+ 
++            if (!tls_session_is_established (self))
++              {
++                self->raised_alert_desc = SSL_AD_UNEXPECTED_MESSAGE;
++                g_propagate_error (error, fpi_device_error_new_msg (
++                                              FP_DEVICE_ERROR_PROTO,
++                                              "Application data received before TLS handshake finished"));
++                return FALSE;
++              }
++
+             app_data_size = fpi_byte_reader_get_remaining (&reader);
+             fpi_byte_reader_get_data (&reader, app_data_size, &app_data);
+ 
+@@ -1700,7 +1725,8 @@ tls_session_new (const guint8 *client_cert, gsize client_cert_len,
+ 
+   self->raised_alert_desc = TLS_NO_ALERT;
+ 
+-  RAND_bytes (self->client_random, RANDOM_SIZE);
++  if (RAND_bytes (self->client_random, RANDOM_SIZE) != 1)
++    g_critical ("RAND_bytes failed for client random");
+ 
+   self->version = TLS1_2_VERSION;
+ 
+@@ -1763,11 +1789,27 @@ tls_session_send_application_data (TlsSession *self,
+   return TRUE;
+ }
+ 
++gboolean
++tls_session_is_established (TlsSession *self)
++{
++  return self != NULL &&
++         self->handshake_phase == FINISHED &&
++         self->client_cs == TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384 &&
++         self->server_cs == TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384 &&
++         self->encr_key != NULL && self->decr_key != NULL;
++}
++
+ gboolean
+ tls_session_wrap (TlsSession *self, guint8 *pdata, gsize pdata_size, guint8 **cdata, gsize *cdata_size, GError **error)
+ {
+   GError *local_error = NULL;
+-  // g_assert(self->established);
++
++  if (!tls_session_is_established (self))
++    {
++      g_propagate_error (error, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                          "TLS session not established"));
++      return FALSE;
++    }
+ 
+   // Send application data message
+   if (!tls_session_send_application_data (self, pdata, pdata_size, &local_error))
+@@ -1789,7 +1831,13 @@ gboolean
+ tls_session_unwrap (TlsSession *self, guint8 *cdata, gsize cdata_size, guint8 **pdata, gsize *pdata_size, GError **error)
+ {
+   GError *local_error = NULL;
+-  // g_assert(self->established);
++
++  if (!tls_session_is_established (self))
++    {
++      g_propagate_error (error, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                          "TLS session not established"));
++      return FALSE;
++    }
+ 
+   // "Receive" data
+   if (!tls_session_receive_ciphertext (self, cdata, cdata_size, &local_error))
+diff --git a/libfprint/drivers/synatlsmoc/tls_session.h b/libfprint/drivers/synatlsmoc/tls_session.h
+index 943c3fc..cd90f7c 100644
+--- a/libfprint/drivers/synatlsmoc/tls_session.h
++++ b/libfprint/drivers/synatlsmoc/tls_session.h
+@@ -45,6 +45,7 @@ void tls_session_free (TlsSession *self);
+ gboolean tls_session_establish (TlsSession *self, GError **error);
+ gboolean tls_session_flush_send_buffer (TlsSession *self, guint8 **data, gsize *size, GError **error);
+ gboolean tls_session_has_data (TlsSession *self);
++gboolean tls_session_is_established (TlsSession *self);
+ gboolean tls_session_receive_ciphertext (TlsSession *self, guint8 *data, gsize size, GError **error);
+ gboolean tls_session_wrap (TlsSession *self, guint8 *pdata, gsize pdata_size, guint8 **cdata, gsize *cdata_size, GError **error);
+ gboolean tls_session_unwrap (TlsSession *self, guint8 *cdata, gsize cdata_size, guint8 **pdata, gsize *pdata_size, GError **error);
+diff --git a/libfprint/fp-device.c b/libfprint/fp-device.c
+index cda1d44..a0b12c2 100644
+--- a/libfprint/fp-device.c
++++ b/libfprint/fp-device.c
+@@ -876,7 +876,7 @@ fp_device_set_persistent_data (FpDevice *device,
+       return FALSE;
+     }
+ 
+-  g_variant_get (stored, "(issv)", &version, &driver, &device_id, &loaded);
++  g_variant_get (stored, "(i&s&sv)", &version, &driver, &device_id, &loaded);
+   if (version != 1)
+     {
+       g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+-- 
+2.53.0
+
